@@ -8,6 +8,8 @@ FAILS=0; PASSES=0
 assert_eq() { if [[ "$1" == "$2" ]]; then PASSES=$((PASSES+1)); else FAILS=$((FAILS+1)); echo "FAIL $3: ожидалось '$1', получено '$2'"; fi; }
 assert_fail() { if "$@" >/dev/null 2>&1; then FAILS=$((FAILS+1)); echo "FAIL: '$*' должно было упасть"; else PASSES=$((PASSES+1)); fi; }
 mk_conf() { local f="$1"; shift; printf '%s\n' "$@" > "$f"; }
+# Права файла в восьмеричном виде: GNU stat (Linux) и BSD stat (macOS) различаются
+file_mode() { if stat --version >/dev/null 2>&1; then stat -c %a "$1"; else stat -f %Lp "$1"; fi; }
 TMPT="$(mktemp -d)"; trap 'rm -rf "$TMPT"' EXIT
 
 # shellcheck source=/dev/null
@@ -97,7 +99,7 @@ test_install_config() {
   mk_conf "$TMPT/c1.conf" "[Interface]" "PrivateKey = a" "[Peer]" "Endpoint = h:1" "AllowedIPs = 10.0.0.0/24"
   local dst; dst="$(install_config "$TMPT/c1.conf" awg0 2>/dev/null)"
   assert_eq "$d/awg0.conf" "$dst" "dst path"
-  assert_eq "600" "$(stat -f %Lp "$dst" 2>/dev/null || stat -c %a "$dst")" "mode 600"
+  assert_eq "600" "$(file_mode "$dst")" "mode 600"
   mk_conf "$TMPT/c2.conf" "[Interface]" "PrivateKey = b" "[Peer]" "Endpoint = h:1" "AllowedIPs = 10.0.0.0/24"
   install_config "$TMPT/c2.conf" awg0 >/dev/null 2>&1
   assert_eq 1 "$(ls "$d"/awg0.conf.bak.* | wc -l | tr -d ' ')" "backup created"
