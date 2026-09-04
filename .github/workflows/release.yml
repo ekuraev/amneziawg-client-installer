@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: сборка ассетов и публикация релиза
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Проверки
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck install-awg-client.sh tests/*.sh
+          bash tests/test_installer.sh
+      - name: Подстановка версии
+        run: |
+          mkdir -p dist
+          sed "s/^readonly SCRIPT_VERSION=\"dev\"$/readonly SCRIPT_VERSION=\"${GITHUB_REF_NAME}\"/" install-awg-client.sh > dist/install-awg-client.sh
+          grep -q "SCRIPT_VERSION=\"${GITHUB_REF_NAME}\"" dist/install-awg-client.sh
+          bash -n dist/install-awg-client.sh
+          bash dist/install-awg-client.sh --version
+          (cd dist && sha256sum install-awg-client.sh > install-awg-client.sh.sha256)
+          cat dist/install-awg-client.sh.sha256
+      - name: Публикация релиза
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/install-awg-client.sh dist/install-awg-client.sh.sha256
