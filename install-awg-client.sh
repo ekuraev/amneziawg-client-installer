@@ -25,6 +25,8 @@ readonly DKMS_VER="1.0.0"
 
 CONF_SRC=""; IFACE="awg0"; USERSPACE=0; NO_START=0
 EXCLUDE_LAN=0; EXCLUDE_LAN_LIST=""; EXCLUDE_SUBNETS=()
+CONFIG_ONLY=0; REINSTALL=0; NO_EXCLUDE_LAN=0; MODE=""
+DST_CONF=""; CONFIG_CHANGED=0
 readonly EXCLUDE_MARK_BEGIN="# >>> amneziawg-client-installer exclude-lan >>>"
 readonly EXCLUDE_MARK_END="# <<< amneziawg-client-installer exclude-lan <<<"
 WORK_DIR=""
@@ -40,9 +42,24 @@ log_warn() { echo -e "\e[33m[!]\e[0m $*" >&2; }
 log_err()  { echo -e "\e[31m[x]\e[0m $*" >&2; }
 die()      { log_err "$*"; exit 1; }
 
+# ask_yes_no <вопрос> <y|n по умолчанию>: читает ответ с терминала (не со stdin,
+# при curl | bash там лежит сам скрипт). Без терминала берётся значение по умолчанию.
+ask_yes_no() {
+  local prompt="$1" default="$2" ans="" tty="${AWG_TTY:-/dev/tty}" hint="[y/N]"
+  [[ "$default" == y ]] && hint="[Y/n]"
+  log_warn "$prompt $hint"
+  if [[ -r "$tty" ]]; then
+    read -r ans < "$tty" || true
+  else
+    log_warn "Нет терминала для ответа, принимаю вариант по умолчанию: $default"
+  fi
+  [[ -z "$ans" ]] && ans="$default"
+  [[ "$ans" =~ ^[yYдД] ]]
+}
+
 usage() {
   cat <<EOF
-Использование: sudo $0 <client.conf> [--iface NAME] [--exclude-lan[=CIDR,...]] [--userspace] [--no-start]
+Использование: sudo $0 <client.conf> [--iface NAME] [--exclude-lan[=CIDR,...]] [--config-only|--reinstall] [--userspace] [--no-start]
 
   <client.conf>   клиентский конфиг AmneziaWG (формат awg-quick)
   --iface NAME    имя интерфейса (по умолчанию awg0)
@@ -50,6 +67,9 @@ usage() {
                   подключена напрямую (Pi остаётся доступной в своей сети)
   --exclude-lan=192.168.0.0/16,10.0.0.0/24
                   то же, но со своим списком подсетей
+  --no-exclude-lan убрать исключение локальной сети из установленного конфига
+  --config-only   компоненты уже установлены: только обновить конфиг и перезапустить
+  --reinstall     полная переустановка без вопросов (обновляет модуль и tools)
   --userspace     не собирать модуль ядра, сразу ставить amneziawg-go
   --no-start      установить, но не поднимать туннель
   --version       версия скрипта
@@ -67,11 +87,15 @@ EOF
 
 parse_args() {
   CONF_SRC=""; IFACE="awg0"; USERSPACE=0; NO_START=0; EXCLUDE_LAN=0; EXCLUDE_LAN_LIST=""
+  CONFIG_ONLY=0; REINSTALL=0; NO_EXCLUDE_LAN=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --iface) [[ $# -ge 2 ]] || die "--iface требует значение"; IFACE="$2"; shift 2 ;;
       --exclude-lan) EXCLUDE_LAN=1; EXCLUDE_LAN_LIST=""; shift ;;
       --exclude-lan=*) EXCLUDE_LAN=1; EXCLUDE_LAN_LIST="${1#--exclude-lan=}"; shift ;;
+      --no-exclude-lan) NO_EXCLUDE_LAN=1; shift ;;
+      --config-only) CONFIG_ONLY=1; shift ;;
+      --reinstall) REINSTALL=1; shift ;;
       --userspace) USERSPACE=1; shift ;;
       --no-start) NO_START=1; shift ;;
       --version) echo "install-awg-client.sh $SCRIPT_VERSION"; exit 0 ;;
@@ -82,6 +106,9 @@ parse_args() {
   done
   [[ -n "$CONF_SRC" ]] || { usage >&2; die "Не указан путь к конфигу"; }
   [[ "$IFACE" =~ ^[a-zA-Z0-9_=+.-]{1,15}$ ]] || die "Недопустимое имя интерфейса: $IFACE"
+  [[ $CONFIG_ONLY -eq 1 && $REINSTALL -eq 1 ]] && die "--config-only и --reinstall несовместимы"
+  [[ $EXCLUDE_LAN -eq 1 && $NO_EXCLUDE_LAN -eq 1 ]] && die "--exclude-lan и --no-exclude-lan несовместимы"
+  return 0
 }
 
 # ---------------------------------------------------------------- конфиг
@@ -177,6 +204,59 @@ apply_exclude_lan() {
       fi
     done < "$src"
   } > "$dst"
+}
+
+# ---------------------------------------------------------------- режим: установка или обновление конфига
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# 0, если awg/awg-quick есть и есть хотя бы одна реализация (модуль ядра или amneziawg-go)
+is_installed() {
+  local sysfs="${AWG_MODULE_SYSFS:-/sys/module/amneziawg}" gobin="${AWG_GO_BIN_PATH:-/usr/local/bin/amneziawg-go}"
+  have_cmd awg && have_cmd awg-quick || return 1
+  [[ -e "$sysfs" || -x "$gobin" ]]
+}
+
+# Заполняет MODE: install (полная установка) или config (только конфиг)
+decide_mode() {
+  if [[ $REINSTALL -eq 1 ]]; then
+    MODE=install; return 0
+  fi
+  if [[ $CONFIG_ONLY -eq 1 ]]; then
+    is_installed || die "Компоненты AmneziaWG не найдены, --config-only невозможен. Запустите без этого флага."
+    MODE=config; return 0
+  fi
+  if is_installed; then
+    log_info "Компоненты AmneziaWG уже установлены."
+    if ask_yes_no "Только обновить конфиг, без пересборки модуля и tools?" y; then
+      MODE=config
+    else
+      MODE=install
+    fi
+  else
+    MODE=install
+  fi
+}
+
+# Печатает подсети из блока exclude-lan установленного конфига через запятую (или ничего)
+extract_exclude_subnets() {
+  [[ -f "$1" ]] || return 0
+  sed -n 's/^PostUp = ip -4 rule add to \([0-9./]*\) lookup main priority 100$/\1/p' "$1" | paste -sd, - | tr -d '\n'
+}
+
+# Решает, сохранять ли исключение локальной сети из установленного конфига,
+# если пользователь не передал --exclude-lan / --no-exclude-lan.
+decide_exclude_lan() {
+  local installed="$1" prev
+  [[ $EXCLUDE_LAN -eq 1 || $NO_EXCLUDE_LAN -eq 1 ]] && return 0
+  prev="$(extract_exclude_subnets "$installed")"
+  [[ -n "$prev" ]] || return 0
+  log_info "В установленном конфиге локальная сеть исключена из туннеля: ${prev//,/ }"
+  if ask_yes_no "Сохранить исключение локальной сети?" y; then
+    EXCLUDE_LAN=1; EXCLUDE_LAN_LIST="$prev"
+  else
+    log_info "Исключение локальной сети будет убрано"
+  fi
 }
 
 # ---------------------------------------------------------------- версии
@@ -370,17 +450,21 @@ ensure_dns_support() {
   apt_install openresolv || log_warn "Не удалось установить openresolv, строка DNS работать не будет"
 }
 
-# Копирует конфиг в каталог AmneziaWG, печатает путь назначения.
+# Копирует конфиг в каталог AmneziaWG. Результат: DST_CONF (путь) и CONFIG_CHANGED (0/1).
 install_config() {
-  local src="$1" iface="$2" dir="${CONF_DIR_OVERRIDE:-$CONF_DIR}" dst
-  dst="$dir/$iface.conf"
+  local src="$1" iface="$2" dir="${CONF_DIR_OVERRIDE:-$CONF_DIR}"
+  DST_CONF="$dir/$iface.conf"; CONFIG_CHANGED=1
   install -d -m 0700 "$dir"
-  if [[ -f "$dst" ]] && ! cmp -s "$src" "$dst"; then
-    cp -p "$dst" "$dst.bak.$(date +%Y%m%d%H%M%S)"
-    log_warn "Прежний конфиг сохранён как $dst.bak.*"
+  if [[ -f "$DST_CONF" ]]; then
+    if cmp -s "$src" "$DST_CONF"; then
+      CONFIG_CHANGED=0
+      chmod 0600 "$DST_CONF"
+      return 0
+    fi
+    cp -p "$DST_CONF" "$DST_CONF.bak.$(date +%Y%m%d%H%M%S)"
+    log_warn "Прежний конфиг сохранён как $DST_CONF.bak.*"
   fi
-  install -m 0600 "$src" "$dst"
-  echo "$dst"
+  install -m 0600 "$src" "$DST_CONF"
 }
 
 # 0 — можно запускать туннель, 1 — пользователь отказался.
@@ -397,19 +481,17 @@ confirm_ssh_risk() {
     done
   fi
   log_warn "Вы подключены по SSH, а конфиг направляет весь трафик (0.0.0.0/0) в туннель."
-  log_warn "После запуска SSH-сессия может оборваться. Продолжить запуск? [y/N]"
-  local ans="" tty="${AWG_TTY:-/dev/tty}"
-  if [[ -r "$tty" ]]; then
-    read -r ans < "$tty" || true
-  else
-    log_warn "Нет терминала для ответа, запуск туннеля откладываю."
-  fi
-  [[ "$ans" =~ ^[yYдД] ]]
+  ask_yes_no "После запуска SSH-сессия может оборваться. Продолжить запуск?" n
 }
 
 start_tunnel() {
-  local iface="$1" unit="awg-quick@$1"
+  local iface="$1" changed="${2:-1}" unit="awg-quick@$1"
   if systemctl is-active --quiet "$unit"; then
+    if [[ "$changed" -eq 0 ]]; then
+      log_info "Конфиг не изменился, туннель уже работает, перезапуск не нужен"
+      run_logged systemctl enable "$unit" || true
+      return 0
+    fi
     log_info "Перезапуск $unit..."
     run_logged systemctl restart "$unit" || die "Не удалось перезапустить $unit. Смотрите: journalctl -u $unit"
     run_logged systemctl enable "$unit" || true
@@ -432,16 +514,25 @@ start_tunnel() {
 print_summary() {
   local iface="$1" dst="$2"
   echo
-  log_ok "Установка завершена"
-  echo "  Реализация:      ${IMPL:-не установлена}"
-  [[ "$IMPL" == "kernel" ]]    && echo "  Модуль ядра:     $KMOD_TAG (DKMS, пересобирается при обновлении ядра)"
-  [[ "$IMPL" == "userspace" ]] && echo "  amneziawg-go:    $GO_TAG (/usr/local/bin/amneziawg-go)"
-  echo "  amneziawg-tools: $TOOLS_TAG"
+  if [[ "$MODE" == config ]]; then
+    log_ok "Конфиг обновлён"
+    echo "  Режим:           только конфиг (компоненты не трогались)"
+    echo "  Реализация:      ${IMPL:-неизвестна}"
+    echo "  amneziawg-tools: $(awg --version 2>/dev/null | head -n1)"
+  else
+    log_ok "Установка завершена"
+    echo "  Режим:           полная установка"
+    echo "  Реализация:      ${IMPL:-не установлена}"
+    [[ "$IMPL" == "kernel" ]]    && echo "  Модуль ядра:     $KMOD_TAG (DKMS, пересобирается при обновлении ядра)"
+    [[ "$IMPL" == "userspace" ]] && echo "  amneziawg-go:    $GO_TAG (/usr/local/bin/amneziawg-go)"
+    echo "  amneziawg-tools: $TOOLS_TAG"
+  fi
   echo "  Конфиг:          $dst"
   (( ${#EXCLUDE_SUBNETS[@]} > 0 )) && echo "  Вне туннеля:     ${EXCLUDE_SUBNETS[*]}"
   echo "  Лог установки:   $LOG_FILE"
   echo
   echo "Управление:"
+  echo "  sudo $0 <client.conf> --config-only   # применить новый конфиг"
   echo "  sudo awg show $iface"
   echo "  sudo systemctl status awg-quick@$iface"
   echo "  sudo systemctl stop|start|restart awg-quick@$iface"
@@ -458,6 +549,8 @@ main() {
   validate_config "$CONF_SRC"
   touch "$LOG_FILE"; chmod 0600 "$LOG_FILE"
   WORK_DIR="$(mktemp -d /tmp/awg-client.XXXXXX)"; trap cleanup EXIT
+  decide_mode
+  decide_exclude_lan "$CONF_DIR/$IFACE.conf"
   local conf_to_install="$CONF_SRC"
   if [[ $EXCLUDE_LAN -eq 1 ]]; then
     if config_is_full_tunnel "$CONF_SRC"; then
@@ -469,30 +562,40 @@ main() {
       log_warn "--exclude-lan: конфиг не направляет весь трафик в туннель (нет 0.0.0.0/0), флаг не нужен, пропускаю"
     fi
   fi
-  resolve_versions
-  log_info "Установка базовых зависимостей..."
-  apt_install ca-certificates curl git build-essential make pkg-config \
-    || die "Не удалось установить базовые пакеты, см. $LOG_FILE"
-  if [[ $USERSPACE -eq 1 ]]; then
-    log_info "Режим --userspace: модуль ядра пропускаем"
-    install_userspace
-  elif ! install_kernel_module; then
-    log_warn "Переход на userspace-реализацию amneziawg-go"
-    install_userspace
+  if [[ "$MODE" == install ]]; then
+    resolve_versions
+    log_info "Установка базовых зависимостей..."
+    apt_install ca-certificates curl git build-essential make pkg-config \
+      || die "Не удалось установить базовые пакеты, см. $LOG_FILE"
+    if [[ $USERSPACE -eq 1 ]]; then
+      log_info "Режим --userspace: модуль ядра пропускаем"
+      install_userspace
+    elif ! install_kernel_module; then
+      log_warn "Переход на userspace-реализацию amneziawg-go"
+      install_userspace
+    fi
+    install_tools
+  else
+    log_info "Режим: только обновление конфига"
+    if [[ -e /sys/module/amneziawg ]]; then IMPL="kernel"
+    elif [[ -x /usr/local/bin/amneziawg-go ]]; then IMPL="userspace"; fi
   fi
-  install_tools
   ensure_dns_support "$CONF_SRC"
-  local dst; dst="$(install_config "$conf_to_install" "$IFACE")"
-  log_ok "Конфиг установлен: $dst"
+  install_config "$conf_to_install" "$IFACE"
+  if [[ $CONFIG_CHANGED -eq 1 ]]; then
+    log_ok "Конфиг установлен: $DST_CONF"
+  else
+    log_info "Конфиг не изменился: $DST_CONF"
+  fi
   if [[ $NO_START -eq 1 ]]; then
     log_info "--no-start: туннель не запускаю. Запуск: sudo systemctl enable --now awg-quick@$IFACE"
   elif confirm_ssh_risk "$CONF_SRC"; then
-    start_tunnel "$IFACE"
+    start_tunnel "$IFACE" "$CONFIG_CHANGED"
     awg show "$IFACE" 2>/dev/null || true
   else
     log_info "Запуск отменён. Позже: sudo systemctl enable --now awg-quick@$IFACE"
   fi
-  print_summary "$IFACE" "$dst"
+  print_summary "$IFACE" "$DST_CONF"
 }
 
 # Запускаем main при прямом вызове и при `curl ... | bash -s -- ...` (BASH_SOURCE пуст),

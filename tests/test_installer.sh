@@ -97,11 +97,17 @@ test_header_candidates() {
 test_install_config() {
   local d="$TMPT/etc"; CONF_DIR_OVERRIDE="$d"
   mk_conf "$TMPT/c1.conf" "[Interface]" "PrivateKey = a" "[Peer]" "Endpoint = h:1" "AllowedIPs = 10.0.0.0/24"
-  local dst; dst="$(install_config "$TMPT/c1.conf" awg0 2>/dev/null)"
+  install_config "$TMPT/c1.conf" awg0 2>/dev/null
+  local dst="$DST_CONF"
   assert_eq "$d/awg0.conf" "$dst" "dst path"
+  assert_eq 1 "$CONFIG_CHANGED" "first install -> changed"
   assert_eq "600" "$(file_mode "$dst")" "mode 600"
+  install_config "$TMPT/c1.conf" awg0 2>/dev/null
+  assert_eq 0 "$CONFIG_CHANGED" "same config -> unchanged"
+  assert_eq 0 "$(ls "$d"/awg0.conf.bak.* 2>/dev/null | wc -l | tr -d ' ')" "no backup when unchanged"
   mk_conf "$TMPT/c2.conf" "[Interface]" "PrivateKey = b" "[Peer]" "Endpoint = h:1" "AllowedIPs = 10.0.0.0/24"
-  install_config "$TMPT/c2.conf" awg0 >/dev/null 2>&1
+  install_config "$TMPT/c2.conf" awg0 2>/dev/null
+  assert_eq 1 "$CONFIG_CHANGED" "different config -> changed"
   assert_eq 1 "$(ls "$d"/awg0.conf.bak.* | wc -l | tr -d ' ')" "backup created"
   unset CONF_DIR_OVERRIDE
 }
@@ -181,10 +187,67 @@ test_confirm_ssh_risk_exclude_lan() {
   ( SSH_CONNECTION="203.0.113.5 5555 192.168.1.10 22"; AWG_TTY="$TMPT/no-such-tty"; EXCLUDE_SUBNETS=(192.168.1.0/24); confirm_ssh_risk "$TMPT/full2.conf" 2>/dev/null ); assert_eq 1 $? "ssh client outside lan -> prompt/refuse"
 }
 
+# --- режим обновления ---
+test_parse_update_flags() {
+  parse_args --config-only /tmp/x.conf;  assert_eq 1 "$CONFIG_ONLY" "config-only flag"
+  parse_args --reinstall /tmp/x.conf;    assert_eq 1 "$REINSTALL" "reinstall flag"
+  parse_args --no-exclude-lan /tmp/x.conf; assert_eq 1 "$NO_EXCLUDE_LAN" "no-exclude-lan flag"
+  parse_args /tmp/x.conf
+  assert_eq "0 0 0" "$CONFIG_ONLY $REINSTALL $NO_EXCLUDE_LAN" "update flags default off"
+  assert_fail bash -c "source '$SCRIPT'; parse_args --config-only --reinstall /tmp/x.conf"
+  assert_fail bash -c "source '$SCRIPT'; parse_args --exclude-lan --no-exclude-lan /tmp/x.conf"
+}
+test_ask_yes_no() {
+  echo n > "$TMPT/tty-n"; echo y > "$TMPT/tty-y"; : > "$TMPT/tty-empty"
+  ( AWG_TTY="$TMPT/no-such-tty"; ask_yes_no "q?" y 2>/dev/null ); assert_eq 0 $? "no tty default y"
+  ( AWG_TTY="$TMPT/no-such-tty"; ask_yes_no "q?" n 2>/dev/null ); assert_eq 1 $? "no tty default n"
+  ( AWG_TTY="$TMPT/tty-n"; ask_yes_no "q?" y 2>/dev/null ); assert_eq 1 $? "answer n"
+  ( AWG_TTY="$TMPT/tty-y"; ask_yes_no "q?" n 2>/dev/null ); assert_eq 0 $? "answer y"
+  ( AWG_TTY="$TMPT/tty-empty"; ask_yes_no "q?" y 2>/dev/null ); assert_eq 0 $? "empty answer -> default y"
+  ( AWG_TTY="$TMPT/tty-empty"; ask_yes_no "q?" n 2>/dev/null ); assert_eq 1 $? "empty answer -> default n"
+}
+test_is_installed() {
+  : > "$TMPT/awg-go"; chmod +x "$TMPT/awg-go"
+  ( have_cmd() { return 0; }; AWG_MODULE_SYSFS="$TMPT/nope"; AWG_GO_BIN_PATH="$TMPT/awg-go"; is_installed ); assert_eq 0 $? "tools + go bin -> installed"
+  ( have_cmd() { return 0; }; AWG_MODULE_SYSFS="$TMPT"; AWG_GO_BIN_PATH="$TMPT/nope"; is_installed ); assert_eq 0 $? "tools + module -> installed"
+  ( have_cmd() { return 0; }; AWG_MODULE_SYSFS="$TMPT/nope"; AWG_GO_BIN_PATH="$TMPT/nope"; is_installed ); assert_eq 1 $? "tools only -> not installed"
+  ( have_cmd() { return 1; }; AWG_MODULE_SYSFS="$TMPT"; AWG_GO_BIN_PATH="$TMPT/awg-go"; is_installed ); assert_eq 1 $? "no tools -> not installed"
+}
+test_decide_mode() {
+  local m
+  m="$(REINSTALL=1; CONFIG_ONLY=0; is_installed() { return 0; }; decide_mode >/dev/null 2>&1; echo "$MODE")"; assert_eq install "$m" "reinstall -> install"
+  m="$(REINSTALL=0; CONFIG_ONLY=0; is_installed() { return 1; }; decide_mode >/dev/null 2>&1; echo "$MODE")"; assert_eq install "$m" "not installed -> install"
+  m="$(REINSTALL=0; CONFIG_ONLY=1; is_installed() { return 0; }; decide_mode >/dev/null 2>&1; echo "$MODE")"; assert_eq config "$m" "config-only -> config"
+  assert_fail bash -c "source '$SCRIPT'; CONFIG_ONLY=1; is_installed() { return 1; }; decide_mode"
+  m="$(REINSTALL=0; CONFIG_ONLY=0; AWG_TTY="$TMPT/no-such-tty"; is_installed() { return 0; }; decide_mode >/dev/null 2>&1; echo "$MODE")"; assert_eq config "$m" "installed, no tty -> config"
+  m="$(REINSTALL=0; CONFIG_ONLY=0; AWG_TTY="$TMPT/tty-n"; is_installed() { return 0; }; decide_mode >/dev/null 2>&1; echo "$MODE")"; assert_eq install "$m" "installed, answer n -> install"
+  m="$(REINSTALL=0; CONFIG_ONLY=0; AWG_TTY="$TMPT/tty-y"; is_installed() { return 0; }; decide_mode >/dev/null 2>&1; echo "$MODE")"; assert_eq config "$m" "installed, answer y -> config"
+}
+test_decide_exclude_lan() {
+  mk_conf "$TMPT/src3.conf" "[Interface]" "PrivateKey = a" "[Peer]" "Endpoint = h:1" "AllowedIPs = 0.0.0.0/0"
+  apply_exclude_lan "$TMPT/src3.conf" "$TMPT/inst.conf" 192.168.1.0/24 192.168.50.0/24
+  assert_eq "192.168.1.0/24,192.168.50.0/24" "$(extract_exclude_subnets "$TMPT/inst.conf")" "extract subnets from block"
+  assert_eq "" "$(extract_exclude_subnets "$TMPT/src3.conf")" "no block -> empty"
+  local r
+  r="$(EXCLUDE_LAN=0; NO_EXCLUDE_LAN=0; AWG_TTY="$TMPT/no-such-tty"; decide_exclude_lan "$TMPT/inst.conf" >/dev/null 2>&1; echo "$EXCLUDE_LAN|$EXCLUDE_LAN_LIST")"
+  assert_eq "1|192.168.1.0/24,192.168.50.0/24" "$r" "block present, no tty -> keep with same subnets"
+  r="$(EXCLUDE_LAN=0; NO_EXCLUDE_LAN=0; AWG_TTY="$TMPT/tty-n"; decide_exclude_lan "$TMPT/inst.conf" >/dev/null 2>&1; echo "$EXCLUDE_LAN")"
+  assert_eq 0 "$r" "block present, answer n -> drop"
+  r="$(EXCLUDE_LAN=0; NO_EXCLUDE_LAN=1; AWG_TTY="$TMPT/tty-y"; decide_exclude_lan "$TMPT/inst.conf" >/dev/null 2>&1; echo "$EXCLUDE_LAN")"
+  assert_eq 0 "$r" "--no-exclude-lan -> drop without asking"
+  r="$(EXCLUDE_LAN=1; EXCLUDE_LAN_LIST=""; NO_EXCLUDE_LAN=0; AWG_TTY="$TMPT/tty-n"; decide_exclude_lan "$TMPT/inst.conf" >/dev/null 2>&1; echo "$EXCLUDE_LAN|$EXCLUDE_LAN_LIST")"
+  assert_eq "1|" "$r" "--exclude-lan given -> keep flag, no question"
+  r="$(EXCLUDE_LAN=0; NO_EXCLUDE_LAN=0; AWG_TTY="$TMPT/tty-y"; decide_exclude_lan "$TMPT/src3.conf" >/dev/null 2>&1; echo "$EXCLUDE_LAN")"
+  assert_eq 0 "$r" "no block -> stays off"
+  r="$(EXCLUDE_LAN=0; NO_EXCLUDE_LAN=0; AWG_TTY="$TMPT/tty-y"; decide_exclude_lan "$TMPT/missing.conf" >/dev/null 2>&1; echo "$EXCLUDE_LAN")"
+  assert_eq 0 "$r" "no installed conf -> stays off"
+}
+
 test_parse_args_defaults; test_parse_args_flags; test_parse_args_bad_iface; test_parse_args_no_conf; test_version_flag; test_pipe_mode
 test_validate_config
 test_resolve_versions_offline; test_resolve_versions_online; test_resolve_versions_env
 test_header_candidates
 test_install_config; test_confirm_ssh_risk
 test_parse_exclude_lan; test_validate_cidr4; test_ip_in_cidr; test_detect_lan_subnets; test_resolve_exclude_subnets; test_apply_exclude_lan; test_confirm_ssh_risk_exclude_lan
+test_parse_update_flags; test_ask_yes_no; test_is_installed; test_decide_mode; test_decide_exclude_lan
 echo "PASS=$PASSES FAIL=$FAILS"; [[ $FAILS -eq 0 ]]
