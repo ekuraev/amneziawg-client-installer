@@ -24,6 +24,9 @@ readonly DKMS_NAME="amneziawg"
 readonly DKMS_VER="1.0.0"
 
 CONF_SRC=""; IFACE="awg0"; USERSPACE=0; NO_START=0
+EXCLUDE_LAN=0; EXCLUDE_LAN_LIST=""; EXCLUDE_SUBNETS=()
+readonly EXCLUDE_MARK_BEGIN="# >>> amneziawg-client-installer exclude-lan >>>"
+readonly EXCLUDE_MARK_END="# <<< amneziawg-client-installer exclude-lan <<<"
 WORK_DIR=""
 ARCH=""; OS_ID=""; _APT_UPDATED=0
 KMOD_TAG=""; TOOLS_TAG=""; GO_TAG=""; GOLANG_VERSION=""
@@ -39,10 +42,14 @@ die()      { log_err "$*"; exit 1; }
 
 usage() {
   cat <<EOF
-Использование: sudo $0 <client.conf> [--iface NAME] [--userspace] [--no-start]
+Использование: sudo $0 <client.conf> [--iface NAME] [--exclude-lan[=CIDR,...]] [--userspace] [--no-start]
 
   <client.conf>   клиентский конфиг AmneziaWG (формат awg-quick)
   --iface NAME    имя интерфейса (по умолчанию awg0)
+  --exclude-lan   не пускать в туннель локальные IPv4-подсети, к которым Pi
+                  подключена напрямую (Pi остаётся доступной в своей сети)
+  --exclude-lan=192.168.0.0/16,10.0.0.0/24
+                  то же, но со своим списком подсетей
   --userspace     не собирать модуль ядра, сразу ставить amneziawg-go
   --no-start      установить, но не поднимать туннель
   --version       версия скрипта
@@ -59,10 +66,12 @@ EOF
 # ---------------------------------------------------------------- аргументы
 
 parse_args() {
-  CONF_SRC=""; IFACE="awg0"; USERSPACE=0; NO_START=0
+  CONF_SRC=""; IFACE="awg0"; USERSPACE=0; NO_START=0; EXCLUDE_LAN=0; EXCLUDE_LAN_LIST=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --iface) [[ $# -ge 2 ]] || die "--iface требует значение"; IFACE="$2"; shift 2 ;;
+      --exclude-lan) EXCLUDE_LAN=1; EXCLUDE_LAN_LIST=""; shift ;;
+      --exclude-lan=*) EXCLUDE_LAN=1; EXCLUDE_LAN_LIST="${1#--exclude-lan=}"; shift ;;
       --userspace) USERSPACE=1; shift ;;
       --no-start) NO_START=1; shift ;;
       --version) echo "install-awg-client.sh $SCRIPT_VERSION"; exit 0 ;;
@@ -94,6 +103,80 @@ config_has_dns() { _conf_has_key "$1" DNS; }
 
 config_is_full_tunnel() {
   grep -Ei '^[[:space:]]*AllowedIPs[[:space:]]*=' "$1" | grep -Eq '(^|[^0-9])0\.0\.0\.0/0|::/0'
+}
+
+# ---------------------------------------------------------------- исключение локальной сети
+
+validate_cidr4() {
+  local c="$1" ip pfx o x
+  [[ "$c" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
+  ip="${c%/*}"; pfx="${c#*/}"
+  (( 10#$pfx <= 32 )) || return 1
+  IFS=. read -r -a o <<< "$ip"
+  for x in "${o[@]}"; do (( 10#$x <= 255 )) || return 1; done
+}
+
+ip4_to_int() {
+  local o
+  IFS=. read -r -a o <<< "$1"
+  echo $(( (10#${o[0]} << 24) | (10#${o[1]} << 16) | (10#${o[2]} << 8) | 10#${o[3]} ))
+}
+
+# ip_in_cidr <ip> <cidr>: 0, если адрес входит в подсеть
+ip_in_cidr() {
+  local ip net pfx mask
+  ip="$(ip4_to_int "$1")"; net="$(ip4_to_int "${2%/*}")"; pfx="${2#*/}"
+  if (( 10#$pfx == 0 )); then mask=0; else mask=$(( (0xFFFFFFFF << (32 - 10#$pfx)) & 0xFFFFFFFF )); fi
+  (( (ip & mask) == (net & mask) ))
+}
+
+# Печатает IPv4-подсети физических интерфейсов (без VPN, docker, loopback), по одной на строку.
+detect_lan_subnets() {
+  ip -4 -o route show scope link proto kernel 2>/dev/null \
+    | awk '$1 ~ /\// && $2 == "dev" && $3 !~ /^(lo|awg|wg|docker|br-|veth|virbr|tun|tap)/ { print $1 }' \
+    | sort -u
+}
+
+# Заполняет EXCLUDE_SUBNETS из EXCLUDE_LAN_LIST или автоопределения.
+resolve_exclude_subnets() {
+  local c list=()
+  EXCLUDE_SUBNETS=()
+  if [[ -n "$EXCLUDE_LAN_LIST" ]]; then
+    IFS=, read -r -a list <<< "$EXCLUDE_LAN_LIST"
+    for c in "${list[@]}"; do
+      c="${c// /}"
+      [[ -n "$c" ]] || continue
+      validate_cidr4 "$c" || die "Некорректная IPv4-подсеть в --exclude-lan: $c (пример: 192.168.1.0/24)"
+      EXCLUDE_SUBNETS+=("$c")
+    done
+  else
+    while read -r c; do [[ -n "$c" ]] && EXCLUDE_SUBNETS+=("$c"); done < <(detect_lan_subnets)
+  fi
+  (( ${#EXCLUDE_SUBNETS[@]} > 0 )) || die "Не удалось определить локальные подсети. Укажите явно: --exclude-lan=192.168.1.0/24"
+}
+
+# apply_exclude_lan <src> <dst> <cidr>...: копия конфига с PostUp/PreDown-правилами
+# для локальных подсетей после [Interface]. Старый блок между маркерами заменяется.
+apply_exclude_lan() {
+  local src="$1" dst="$2"; shift 2
+  local c line skip=0 done=0
+  {
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "$EXCLUDE_MARK_BEGIN" ]]; then skip=1; continue; fi
+      if [[ "$line" == "$EXCLUDE_MARK_END" ]]; then skip=0; continue; fi
+      (( skip )) && continue
+      printf '%s\n' "$line"
+      if [[ $done -eq 0 && "$line" =~ ^\[Interface\] ]]; then
+        printf '%s\n' "$EXCLUDE_MARK_BEGIN"
+        for c in "$@"; do
+          printf 'PostUp = ip -4 rule add to %s lookup main priority 100\n' "$c"
+          printf 'PreDown = ip -4 rule del to %s lookup main priority 100 || true\n' "$c"
+        done
+        printf '%s\n' "$EXCLUDE_MARK_END"
+        done=1
+      fi
+    done < "$src"
+  } > "$dst"
 }
 
 # ---------------------------------------------------------------- версии
@@ -304,6 +387,15 @@ install_config() {
 confirm_ssh_risk() {
   [[ -n "${SSH_CONNECTION:-}" ]] || return 0
   config_is_full_tunnel "$1" || return 0
+  local client="${SSH_CONNECTION%% *}" c
+  if [[ "$client" =~ ^[0-9.]+$ ]]; then
+    for c in "${EXCLUDE_SUBNETS[@]}"; do
+      if ip_in_cidr "$client" "$c"; then
+        log_info "SSH-клиент $client в исключённой подсети $c, туннель сессию не затронет"
+        return 0
+      fi
+    done
+  fi
   log_warn "Вы подключены по SSH, а конфиг направляет весь трафик (0.0.0.0/0) в туннель."
   log_warn "После запуска SSH-сессия может оборваться. Продолжить запуск? [y/N]"
   local ans="" tty="${AWG_TTY:-/dev/tty}"
@@ -346,6 +438,7 @@ print_summary() {
   [[ "$IMPL" == "userspace" ]] && echo "  amneziawg-go:    $GO_TAG (/usr/local/bin/amneziawg-go)"
   echo "  amneziawg-tools: $TOOLS_TAG"
   echo "  Конфиг:          $dst"
+  (( ${#EXCLUDE_SUBNETS[@]} > 0 )) && echo "  Вне туннеля:     ${EXCLUDE_SUBNETS[*]}"
   echo "  Лог установки:   $LOG_FILE"
   echo
   echo "Управление:"
@@ -365,6 +458,17 @@ main() {
   validate_config "$CONF_SRC"
   touch "$LOG_FILE"; chmod 0600 "$LOG_FILE"
   WORK_DIR="$(mktemp -d /tmp/awg-client.XXXXXX)"; trap cleanup EXIT
+  local conf_to_install="$CONF_SRC"
+  if [[ $EXCLUDE_LAN -eq 1 ]]; then
+    if config_is_full_tunnel "$CONF_SRC"; then
+      resolve_exclude_subnets
+      log_info "Вне туннеля останутся локальные подсети: ${EXCLUDE_SUBNETS[*]}"
+      conf_to_install="$WORK_DIR/$IFACE.conf"
+      apply_exclude_lan "$CONF_SRC" "$conf_to_install" "${EXCLUDE_SUBNETS[@]}"
+    else
+      log_warn "--exclude-lan: конфиг не направляет весь трафик в туннель (нет 0.0.0.0/0), флаг не нужен, пропускаю"
+    fi
+  fi
   resolve_versions
   log_info "Установка базовых зависимостей..."
   apt_install ca-certificates curl git build-essential make pkg-config \
@@ -378,7 +482,7 @@ main() {
   fi
   install_tools
   ensure_dns_support "$CONF_SRC"
-  local dst; dst="$(install_config "$CONF_SRC" "$IFACE")"
+  local dst; dst="$(install_config "$conf_to_install" "$IFACE")"
   log_ok "Конфиг установлен: $dst"
   if [[ $NO_START -eq 1 ]]; then
     log_info "--no-start: туннель не запускаю. Запуск: sudo systemctl enable --now awg-quick@$IFACE"

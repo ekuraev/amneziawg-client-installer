@@ -118,9 +118,73 @@ test_confirm_ssh_risk() {
   ( SSH_CONNECTION="1 2 3 4"; AWG_TTY="$TMPT/tty-n"; echo y | confirm_ssh_risk "$TMPT/full.conf" 2>/dev/null ); assert_eq 1 $? "stdin ignored"
 }
 
+# --- exclude-lan ---
+test_parse_exclude_lan() {
+  parse_args --exclude-lan /tmp/x.conf
+  assert_eq 1 "$EXCLUDE_LAN" "exclude-lan auto flag"
+  assert_eq "" "$EXCLUDE_LAN_LIST" "exclude-lan auto list empty"
+  parse_args --exclude-lan=192.168.0.0/16,10.0.0.0/24 /tmp/x.conf
+  assert_eq 1 "$EXCLUDE_LAN" "exclude-lan explicit flag"
+  assert_eq "192.168.0.0/16,10.0.0.0/24" "$EXCLUDE_LAN_LIST" "exclude-lan explicit list"
+  parse_args /tmp/x.conf
+  assert_eq 0 "$EXCLUDE_LAN" "exclude-lan default off"
+}
+test_validate_cidr4() {
+  validate_cidr4 192.168.1.0/24; assert_eq 0 $? "cidr ok"
+  validate_cidr4 10.0.0.0/8;     assert_eq 0 $? "cidr /8 ok"
+  validate_cidr4 192.168.1.0;    assert_eq 1 $? "cidr no prefix"
+  validate_cidr4 192.168.1.0/33; assert_eq 1 $? "cidr prefix > 32"
+  validate_cidr4 192.168.300.0/24; assert_eq 1 $? "cidr octet > 255"
+  validate_cidr4 "fd00::/64";    assert_eq 1 $? "cidr ipv6 rejected"
+}
+test_ip_in_cidr() {
+  ip_in_cidr 192.168.1.5 192.168.1.0/24; assert_eq 0 $? "ip in /24"
+  ip_in_cidr 192.168.2.5 192.168.1.0/24; assert_eq 1 $? "ip not in /24"
+  ip_in_cidr 10.200.3.4 10.0.0.0/8;      assert_eq 0 $? "ip in /8"
+  ip_in_cidr 8.8.8.8 0.0.0.0/0;          assert_eq 0 $? "ip in /0"
+}
+test_detect_lan_subnets() {
+  ip() { printf '%s\n' \
+    '192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.10 metric 100' \
+    '10.8.0.0/24 dev awg0 proto kernel scope link src 10.8.0.2' \
+    '172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown' \
+    '192.168.50.0/24 dev wlan0 proto kernel scope link src 192.168.50.7 metric 600'; }
+  assert_eq "192.168.1.0/24 192.168.50.0/24 " "$(detect_lan_subnets | tr '\n' ' ')" "detect lan subnets"
+  unset -f ip
+}
+test_resolve_exclude_subnets() {
+  EXCLUDE_LAN_LIST="192.168.0.0/16, 10.0.0.0/24"; resolve_exclude_subnets
+  assert_eq "192.168.0.0/16 10.0.0.0/24" "${EXCLUDE_SUBNETS[*]}" "explicit subnets parsed"
+  assert_fail bash -c "source '$SCRIPT'; EXCLUDE_LAN_LIST='192.168.1.0/99'; resolve_exclude_subnets"
+  ip() { :; }
+  assert_fail bash -c "source '$SCRIPT'; ip() { :; }; EXCLUDE_LAN_LIST=''; resolve_exclude_subnets"
+  unset -f ip; EXCLUDE_LAN_LIST=""
+}
+test_apply_exclude_lan() {
+  mk_conf "$TMPT/src.conf" "[Interface]" "PrivateKey = a" "Address = 10.8.0.2/32" "[Peer]" "PublicKey = b" "Endpoint = h:1" "AllowedIPs = 0.0.0.0/0"
+  apply_exclude_lan "$TMPT/src.conf" "$TMPT/out1.conf" 192.168.1.0/24 192.168.50.0/24
+  assert_eq 2 "$(grep -c '^PostUp = ip -4 rule add to ' "$TMPT/out1.conf")" "two PostUp"
+  assert_eq 2 "$(grep -c '^PreDown = ip -4 rule del to ' "$TMPT/out1.conf")" "two PreDown"
+  assert_eq "[Interface]" "$(sed -n 1p "$TMPT/out1.conf")" "interface first"
+  assert_eq "$EXCLUDE_MARK_BEGIN" "$(sed -n 2p "$TMPT/out1.conf")" "block right after [Interface]"
+  grep -q 'PostUp = ip -4 rule add to 192.168.1.0/24 lookup main priority 100$' "$TMPT/out1.conf"; assert_eq 0 $? "postup line"
+  grep -q '^AllowedIPs = 0.0.0.0/0$' "$TMPT/out1.conf"; assert_eq 0 $? "AllowedIPs untouched"
+  # идемпотентность: повторная трансформация выхода с другим списком заменяет блок
+  apply_exclude_lan "$TMPT/out1.conf" "$TMPT/out2.conf" 10.0.0.0/24
+  assert_eq 1 "$(grep -c '^PostUp = ' "$TMPT/out2.conf")" "old block replaced"
+  assert_eq 1 "$(grep -c "^$EXCLUDE_MARK_BEGIN\$" "$TMPT/out2.conf")" "single begin marker"
+  assert_eq "$(grep -c '' "$TMPT/src.conf")" "$(grep -v -e '^PostUp' -e '^PreDown' -e '^# ' "$TMPT/out2.conf" | grep -c '')" "other lines preserved"
+}
+test_confirm_ssh_risk_exclude_lan() {
+  mk_conf "$TMPT/full2.conf" "[Interface]" "PrivateKey = a" "[Peer]" "Endpoint = h:1" "AllowedIPs = 0.0.0.0/0"
+  ( SSH_CONNECTION="192.168.1.20 5555 192.168.1.10 22"; AWG_TTY="$TMPT/no-such-tty"; EXCLUDE_SUBNETS=(192.168.1.0/24); confirm_ssh_risk "$TMPT/full2.conf" 2>/dev/null ); assert_eq 0 $? "ssh client in excluded lan -> no prompt"
+  ( SSH_CONNECTION="203.0.113.5 5555 192.168.1.10 22"; AWG_TTY="$TMPT/no-such-tty"; EXCLUDE_SUBNETS=(192.168.1.0/24); confirm_ssh_risk "$TMPT/full2.conf" 2>/dev/null ); assert_eq 1 $? "ssh client outside lan -> prompt/refuse"
+}
+
 test_parse_args_defaults; test_parse_args_flags; test_parse_args_bad_iface; test_parse_args_no_conf; test_version_flag; test_pipe_mode
 test_validate_config
 test_resolve_versions_offline; test_resolve_versions_online; test_resolve_versions_env
 test_header_candidates
 test_install_config; test_confirm_ssh_risk
+test_parse_exclude_lan; test_validate_cidr4; test_ip_in_cidr; test_detect_lan_subnets; test_resolve_exclude_subnets; test_apply_exclude_lan; test_confirm_ssh_risk_exclude_lan
 echo "PASS=$PASSES FAIL=$FAILS"; [[ $FAILS -eq 0 ]]
