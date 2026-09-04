@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# install-awg-client.sh — установка клиента AmneziaWG на Raspberry Pi / Debian / Ubuntu.
+# install-awg-client.sh — установка клиента AmneziaWG на Debian, Ubuntu, Raspberry Pi OS
+# и другие apt-системы с systemd (x86_64, arm64, armhf).
 #
 # Ставит модуль ядра amneziawg через DKMS (fallback: userspace amneziawg-go),
 # собирает amneziawg-tools, кладёт готовый клиентский конфиг в
@@ -63,8 +64,8 @@ usage() {
 
   <client.conf>   клиентский конфиг AmneziaWG (формат awg-quick)
   --iface NAME    имя интерфейса (по умолчанию awg0)
-  --exclude-lan   не пускать в туннель локальные IPv4-подсети, к которым Pi
-                  подключена напрямую (Pi остаётся доступной в своей сети)
+  --exclude-lan   не пускать в туннель локальные IPv4-подсети, к которым машина
+                  подключена напрямую (она остаётся доступной в своей сети)
   --exclude-lan=192.168.0.0/16,10.0.0.0/24
                   то же, но со своим списком подсетей
   --no-exclude-lan убрать исключение локальной сети из установленного конфига
@@ -289,7 +290,7 @@ resolve_versions() {
 check_env() {
   [[ $EUID -eq 0 ]] || die "Запустите скрипт от root: sudo $0 ..."
   command -v systemctl >/dev/null || die "Нужна система на systemd"
-  command -v apt-get   >/dev/null || die "Поддерживаются только apt-системы (Raspberry Pi OS, Debian, Ubuntu)"
+  command -v apt-get   >/dev/null || die "Поддерживаются только apt-системы (Debian, Ubuntu, Raspberry Pi OS и производные)"
   ARCH="$(dpkg --print-architecture)"
   # shellcheck disable=SC1091
   OS_ID="$(. /etc/os-release 2>/dev/null && echo "${ID:-debian}")"
