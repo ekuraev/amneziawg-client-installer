@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2329,SC2034,SC2012,SC2002
+# shellcheck disable=SC2329,SC2317,SC2034,SC2012,SC2002
 # (подмены curl и переменные вроде CONF_DIR_OVERRIDE читаются внутри sourced-скрипта)
 # Тесты чистых функций install-awg-client.sh (без сети и root).
 set -uo pipefail
