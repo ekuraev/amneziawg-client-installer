@@ -226,10 +226,9 @@ CI на GitHub гоняет shellcheck, юнит-тесты и Docker-сборк
 
 ## Чем отличается от bivlked/amneziawg-installer
 
-[Тот проект](https://github.com/bivlked/amneziawg-installer) ставит и
-настраивает **сервер** AmneziaWG, генерирует клиентов, поднимает NAT и панель
-управления. Этот скрипт делает только клиентскую часть и целиком помещается в
-один файл.
+[bivlked/amneziawg-installer](https://github.com/bivlked/amneziawg-installer)
+устанавливает **сервер** AmneziaWG. Этот проект устанавливает исключительно
+**клиент**.
 
 ## Участие
 
